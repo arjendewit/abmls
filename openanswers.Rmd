@@ -1,0 +1,338 @@
+---
+title: "Using topic modeling to analyze open-ended survey questions in the A Broader Mind Longitudinal Survey"
+output: github_document
+params:
+  filename: "C:\\Users\\Gebruiker\\stack\\VU\\ABMLS\\2018 pretest\\abmlspretest-recoded.rds"
+---
+
+Arjen de Wit, Fall 2020
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Besides the standard survey instruments that are based on closed-ended items, open-ended questions can provide rich data. In this document I will analyze the answers to an open-ended survey question in which respondents are asked to imagine themselves in the future. Data are used from the A Broader Mind Longitudinal Survey, an annual survey that tracks the civic, social, professional and academic development of students at Vrije Universiteit Amsterdam. See a pilot report [here](https://osf.io/preprints/socarxiv/su64a/). For the analysis below I use data from the 2018 pre-test sample, which consists of European university students (n=200) sampled through the online platform Prolific.
+
+These analyses are meant to explore the potential of including analyzing open-ended questions in our survey. The rationale behind the survey is that students develop themselves not only in an academic and cognitive sense, but also as persons in a complex society. To what extent do students, during their time at the university, adopt 'a broader mind' on themselves, others and societal issues? 
+
+The survey was designed together with Rosan van Niekerk and René Bekkers. At the end of the survey, we asked respondents to imagine the things they would like to accomplish in their future lives. This provides another measure of one's views on the future, besides the closed survey questions that consume the largest part of the questionnaire. We randomized the wording of the question to examine whether a different time span (in 20 years vs. when you are retired) and a different qualification (proud vs. satisfied) would lead to different answers.
+
+The question asked in the survey was: 
+"(A.1) If you think about yourself and your career (A.2), when would you be (B)? Please elaborate on your answer."
+25% of respondents received A1: 'Imagine you are retired' and B: 'proud';
+25% received A2: 'in 20 years' and B: 'proud';
+25% received A1: 'Imagine you are retired' and B: 'satisfied';
+25% received A2: 'in 20 years' and B: 'Satisfied'.
+
+Below I will show how Latent Dirichlet allocation (LDA) distinguished three topics in the open answers, reflecting the importance of (1) a steady job, (2) sufficient time for family, and (3) a contribution to society. The formulation of the open question did affect the answers. ANOVA tests revealed that topic 1 was significantly less often mentioned in the retired condition (F(1)=6.628, p=0.011), while topic 3 was more often mentioned in this condition (F(1)=12.480, p=0.001). Using the word ‘proud’ vs. ‘satisfied’ did not yield significantly different answers. 
+
+Disclaimer: I am not an expert on the issues covered here. As a relative beginner in R and text mining I built on many great open access resources, most importantly Silge & Robinson's [Text Mining with R](https://www.tidytextmining.com/topicmodeling.html). This document explores the possibilities of using topic modeling in a specific survey. I hope this contributes to improving survey design and survey research, even for researchers in the social sciences who are not necessarily methodologists.
+
+
+
+
+## 1. Data preparation
+
+Open the dataset:
+
+```{r open data, results="hide", warning=FALSE}
+abmls <- readRDS(params$filename)
+```
+
+
+Answers in the four experimental conditions are each in a separate column of the data. First, I merge them into one column. I make a new data frame with only the text:
+
+```{r data handling, results="hide", warning=FALSE, message=FALSE}
+library(dplyr)
+abmls$open <- coalesce(abmls$Q49,	abmls$Q50, abmls$Q52, abmls$Q51)
+open <- data_frame(line = 1:201, text = abmls$open)
+```
+
+```{r open, collapse=TRUE}
+open
+```
+
+
+We see that each row is an answer, often with multiple sentences. For text analysis we want to have a tidy dataset, in which each word is in a separate row:
+
+```{r make it tidy, results="hide", warning=FALSE, message=FALSE}
+library(tidytext)
+tidy_open <- open %>%
+  unnest_tokens(word, text)
+```
+
+```{r tidy_open, collapse=TRUE}
+tidy_open
+tidy_open %>%
+  count(word, sort = TRUE)
+```
+
+
+We can see that the most common words are 'I', 'to', 'a', 'and', etc. These are not so meaningful so we want to exclude them. Additionally I excluded five words that are specific to the question asked, because respondents often repeat a part of the question in their answers: 'proud', 'satisfied', '20', 'career' and 'life'.
+
+```{r stopwords, results="hide", warning=FALSE, message=FALSE}
+stop_words2 <- stop_words
+stop_words2$lexicon <- NULL
+stopwextra <- c("proud", "satisfied", "20", "career", "life")
+stopwextra <- data_frame(line = 1:5, text=stopwextra)
+stopwextra <- stopwextra %>%
+  unnest_tokens(word, text)
+stopwextra$line <- NULL
+stopw <- rbind(stopwextra, stop_words2)
+tidy_open <- tidy_open %>%
+  anti_join(stopw)
+```
+
+```{r count words, collapse=TRUE}
+tidy_open %>%
+  count(word, sort = TRUE)
+```
+
+
+We can see that the most common words are 'job' (occurs 45 times) and 'family' (37 times). To get an overview of the most common words, I make a bar chart of the words that occur more than 10 times in the data:  
+
+```{r lib ggplot2 to plot common words, results="hide", warning=FALSE, message=FALSE}
+library(ggplot2)
+```
+
+```{r plot common words, collapse=TRUE}
+tidy_open %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 10) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  xlab(NULL) +
+  coord_flip()
+```
+
+
+I make a new dataframe with a column for the respondent (resp) and the number of times the word occurs. 
+
+```{r add resp and n, results="hide", warning=FALSE, message=FALSE}
+tidy_openn <- tidy_open %>%
+  count(word, sort = TRUE)
+tidy_open$resp <- tidy_open$line
+tidy_open <- full_join(tidy_open, tidy_openn, by = "word", copy=FALSE)
+```
+
+```{r show tidy_open, collapse=TRUE}
+tidy_open
+```
+
+
+Then I make a Document-Term Matrix.
+
+```{r make ODT, results="hide", warning=FALSE, message=FALSE}
+open_dtm <- tidy_open %>%
+  cast_dtm(resp, word, n)
+```
+
+
+
+
+## 2. Identifying topics
+
+To identify the topics in these data, I used Latent Dirichlet allocation (LDA). In LDA, you have to specify the number of clusters *k* that you want to have identified. I tried the model multiple times with different number of clusters. By plotting the 'best fitting' words for each cluster, we can interpret the clusters theoretically and judge whether these topics make sense.  
+
+```{r topicmodels, results="hide", warning=FALSE, message=FALSE}
+library(topicmodels)
+open_lda <- LDA(open_dtm, k = 3, control = list(seed = 1234))
+open_topics <- tidy(open_lda, matrix = "beta")
+open_topics
+```
+
+```{r plot topic models, collapse=TRUE}
+open_top_terms <- open_topics %>%
+  group_by(topic) %>%
+  top_n(20, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+open_top_terms %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+```
+
+
+As you can see, I chose a solution with three clusters. Each word has a *beta* score for each cluster, which is the probability of a word coming from that topic. 
+
+The first cluster refers to a steady job and a stable life, with words like 'job', 'income', 'live' and 'stable' as top terms. The word 'happy' suggests that respondents not only want a lot of money, but directly relate this to a happy life. The second cluster relates to having sufficient time for family, with words like 'family', 'time', 'enjoy' and 'support'. 'Money' may refer to having sufficient resources to support one's family. The third cluster is more than the others related to contributing to society. Terms with high *betas* here are 'people', 'society', 'impact' and 'positive'. 
+
+
+
+
+## 3. Topic probabilities
+
+Each open answer ('document') has a topic probability *gamma* for each topic, which is the estimated proportion of words in that answer which belongs to that cluster. I made a wide dataframe with these gammas for each topic, in which the document number corresponds with the id number of each respondent.
+
+```{r make wide, results="hide", warning=FALSE, message=FALSE}
+open_documents <- tidy(open_lda, matrix = "gamma")
+library(reshape2)
+open_documents_wide <- dcast(open_documents, document ~ topic, value.var="gamma")
+open_documents_wide$topic1 <- open_documents_wide$`1`
+open_documents_wide$topic2 <- open_documents_wide$`2`
+open_documents_wide$topic3 <- open_documents_wide$`3`
+open_documents_wide$`1` <- NULL
+open_documents_wide$`2` <- NULL
+open_documents_wide$`3` <- NULL
+open_documents_wide$id <- open_documents_wide$document
+open_documents_wide$document <- NULL
+```
+
+
+Let's examine these *gammas*.
+
+```{r libraries for histograms of gammas, results="hide", warning=FALSE, message=FALSE}
+library(ggplot2)
+library(gridExtra)
+```
+
+```{r histograms of gammas, collapse=TRUE}
+p1<- ggplot(open_documents_wide, aes(open_documents_wide$topic1)) + geom_histogram(binwidth=.02) + xlab("Gamma topic 1")
+p2<- ggplot(open_documents_wide, aes(open_documents_wide$topic2)) + geom_histogram(binwidth=.02) + xlab("Gamma topic 2")
+p3<- ggplot(open_documents_wide, aes(open_documents_wide$topic3)) + geom_histogram(binwidth=.02) + xlab("Gamma topic 3")
+grid.arrange(p1, p2, p3)
+```
+
+Although no individual score is exactly 0 or exactly 1, most values are at the extreme ends of the scale. The large majority of *gammas* are very close to 0. I think this is due to the small size of the 'documents': when using, say, 40 words, it is likely that an answer can be identified with only one topic.
+
+
+
+
+## 4. Survey experiment
+
+After having identified the topics, I merged the LDA results with the original dataset. This allows for correlating the topic probability *gamma* with the experimental conditions and other covariates in the data. 
+
+```{r merge LDA with original data, results="hide", warning=FALSE, message=FALSE}
+abmls$id <- rownames(abmls)
+abmls <- full_join(abmls, open_documents_wide, by = "id", copy=FALSE)
+```
+
+
+I made a variable that identifies the experimental condition of each respondent.
+
+```{r experimental condition, results="hide", warning=FALSE, message=FALSE}
+abmls$opencond <- NA
+abmls$opencond[!is.na(abmls$Q49)] <- 1 #20/PROUD
+abmls$opencond[!is.na(abmls$Q50)] <- 2 #20/SATISFIED
+abmls$opencond[!is.na(abmls$Q52)] <- 3 #RETIRED/PROUD
+abmls$opencond[!is.na(abmls$Q51)] <- 4 #RETIRED/SATISFIED
+table(abmls$opencond)
+abmls$openretire <- 0
+abmls$openretire[!is.na(abmls$Q52)|!is.na(abmls$Q51)] <- 1
+table(abmls$openretire)
+abmls$openproud <- 0
+abmls$openproud[!is.na(abmls$Q49)|!is.na(abmls$Q52)] <- 1
+table(abmls$openproud)
+```
+
+
+Now, I can test how the *gammas* differ across experimental conditions.
+
+```{r 20 years vs retired, collapse=TRUE}
+group_by(abmls, openretire) %>%
+  summarise(
+    count = n(),
+    mean = mean(topic1, na.rm = TRUE),
+    sd = sd(topic1, na.rm = TRUE)
+  )
+aov <- aov(topic1 ~ openretire, data = abmls)
+summary(aov)
+group_by(abmls, openretire) %>%
+  summarise(
+    count = n(),
+    mean = mean(topic2, na.rm = TRUE),
+    sd = sd(topic2, na.rm = TRUE)
+  )
+aov <- aov(topic2 ~ openretire, data = abmls)
+summary(aov)
+group_by(abmls, openretire) %>%
+  summarise(
+    count = n(),
+    mean = mean(topic3, na.rm = TRUE),
+    sd = sd(topic3, na.rm = TRUE)
+  )
+aov <- aov(topic3 ~ openretire, data = abmls)
+summary(aov)
+```
+
+The results of ANOVA tests show that topic 1 is less often mentioned in the 'retire' condition, while topic 3 is more often mentioned in the 'retire' condition. If we asked respondents to imagine how life would like at the moment they retire (versus 'in 20 years'), they are more likely to name things related to improving society instead of having a steady job and a stable income. 
+
+
+```{r proud vs satisfied, collapse=TRUE}
+group_by(abmls, openproud) %>%
+  summarise(
+    count = n(),
+    mean = mean(topic1, na.rm = TRUE),
+    sd = sd(topic1, na.rm = TRUE)
+  )
+aov <- aov(topic1 ~ openproud, data = abmls)
+summary(aov)
+group_by(abmls, openproud) %>%
+  summarise(
+    count = n(),
+    mean = mean(topic2, na.rm = TRUE),
+    sd = sd(topic2, na.rm = TRUE)
+  )
+aov <- aov(topic2 ~ openproud, data = abmls)
+summary(aov)
+group_by(abmls, openproud) %>%
+  summarise(
+    count = n(),
+    mean = mean(topic3, na.rm = TRUE),
+    sd = sd(topic3, na.rm = TRUE)
+  )
+aov <- aov(topic3 ~ openproud, data = abmls)
+summary(aov) 
+```
+
+
+Using the words 'When would you be proud?' instead of 'When would you be satisfied?' does not yield significant differences.
+
+
+
+
+## 5. Covariates
+
+Finally, I correlate the *gammas* with other survey instruments. In another survey instrument, we asked respondents what they find important in their future job. 
+
+```{r correlating with professional orientation, collapse=TRUE}
+x <- cbind(abmls$topic1, abmls$topic2, abmls$topic3, abmls$job_1, abmls$job_2, abmls$job_3, abmls$job_4, abmls$job_5, abmls$job_6, abmls$job_7, abmls$job_8)
+x <- na.omit(x)
+x <- cor(x)
+x <- round(x, 3)
+x 
+```
+
+
+Topic 1 (stable income) correlates .11 with prefering a secure job, -.03 with prefering high income and .21 with prefering an easy work load. 
+Topic 2 (time for your family) correlates -.12 with prefering a secure job, -.16 with interesting job, and -.15 with job that is useful to society.
+Topic 3 (contributing to society) correlates .2 with prefering a job that is useful to society.
+
+The service motivation scale, which measures the extent to which respondents find it important to contribute to society in their job, correlates -.18 with topic 2 and .26 with topic 3: 
+
+```{r correlating with service motivation, collapse=TRUE}
+x <- cbind(abmls$topic1, abmls$topic2, abmls$topic3, abmls$servmot)
+x <- na.omit(x)
+x <- cor(x)
+x <- round(x, 3)
+x 
+```
+
+
+These results provide evidence on the external validity of the topics and confirm the interpretation based on the word-topic probabilities. Topic 1 is associated with a secure income, although not necessarily a high income. Topic 2 is associated with family values and a slight disinterest with the broader society. Topic 3 is the most prosocial one, in which contributing to society is deemed important.
+
+The *gamma* scores can be used in further (regression) analyses. An issue is their U-shaped distribution, with many values close to 0 and close to 1. However, they are interval variables and no score is exactly 0 or exactly 1. Re-running the correlations with the natural logarithms of the *gammas* yielded similar results.
+
+
+
+
+## 6. Concluding remarks
+
+For topic modeling (as for all text analysis) you need sufficient data. We explicitly asked respondents to elaborate on their answers, and this may have helped to get descriptions of multiple sentences. Although the sample (n=200) was small, topic modeling seems to work here.
+
+LDA yielded three sensible topics, and their covariates provide evidence of external validity. As such the open answers can be a measure of how university students see their future, which is more flexible than the standard batteries of closed-ended survey items. The method is more inductive, which fits the objectives of the A Broader Mind Longitudinal Survey. It allows researchers to find surprising elements in their data, while respondents may enjoy answering such an open question after dozens of Likert scales. 
+
